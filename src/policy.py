@@ -1,24 +1,3 @@
-"""
-policy.py
-
-PURPOSE:
-  Implements a contextual bandit policy: a small neural network that maps a
-  column's 16-dim feature vector to a predicted "value" (Q-value) for each
-  possible action, plus the logic to (a) pick an action from those values and
-  (b) learn from the reward that comes back after the action is evaluated.
-
-  This file does NOT touch any database. It only deals with plain numbers in,
-  plain numbers/strings out. The simulator (a different file) is responsible
-  for actually applying an action and computing the reward.
-
-LIBRARIES NEEDED:
-  - torch            (pip install torch)
-  - torch.nn         (network layers)
-  - torch.optim      (the optimizer that updates weights)
-  - random           (stdlib -- for epsilon-greedy exploration)
-  - typing           (stdlib -- for type hints, optional but good practice)
-"""
-
 from torch.nn import ReLU
 from torch.nn import Linear
 import random
