@@ -5,7 +5,7 @@ import time
 import statistics
 import os
 import tempfile
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 from query_parser import QueryParser
@@ -24,6 +24,7 @@ class SimulationResult:
     cost_after: float
     write_overhead: float
     reward: float
+    original_index_sql: Optional[str] = None
 
 
 class Simulator:
@@ -37,6 +38,8 @@ class Simulator:
     # Query selection
     # ------------------------------------------------------------------
     def _read_log(self) -> List[dict]:
+        if hasattr(self, "_cached_log"):
+            return self._cached_log
         entries = []
         try:
             with open(self.log_path, "r") as f:
@@ -50,6 +53,7 @@ class Simulator:
                     entries.append(entry)
         except FileNotFoundError:
             pass
+        self._cached_log = entries
         return entries
 
     def _get_relevant_queries(self, table: str, column: str) -> List[dict]:
@@ -102,20 +106,21 @@ class Simulator:
                     return index_name
         return None
 
-    def _apply_action(self, conn: sqlite3.Connection, table: str, column: str, action: str):
+    def _apply_action(self, conn: sqlite3.Connection, table: str, column: str, action: str) -> Optional[str]:
         if action == "INDEX":
             index_name = f"idx_{table}_{column}_auto"
             conn.execute(f'CREATE INDEX IF NOT EXISTS "{index_name}" ON "{table}"("{column}")')
-
+            return None
         elif action == "DROP":
             existing = self._find_index_name(conn, table, column)
             if existing:
+                sql_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name = ?", (existing,)).fetchone()
+                original_sql = sql_row["sql"] if sql_row else None
                 conn.execute(f'DROP INDEX IF EXISTS "{existing}"')
-          
-
+                return original_sql
+            return None
         elif action == "NO_ACTION":
-            pass  
-
+            return None
         else:
             raise ValueError(f"Unknown action: {action}")
 
@@ -123,11 +128,12 @@ class Simulator:
     # Cost measurement via EXPLAIN QUERY PLAN
     # ------------------------------------------------------------------
     def _estimate_cost(self, conn: sqlite3.Connection, queries: List[dict]) -> float:
+        if not queries:
+            return 0.0
         total_cost = 0.0
         for entry in queries:
             sql = entry["sql"]
             try:
-        
                 params = entry.get("params") or []
                 params = [p for p in params if isinstance(p, (int, float, str, bytes))]
                 rows = conn.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
@@ -137,6 +143,27 @@ class Simulator:
                 except sqlite3.Error:
                     continue 
 
+            sql_upper = sql.strip().upper()
+            if sql_upper.startswith(("INSERT", "UPDATE", "DELETE")):
+                # Calculate write overhead by finding the table and counting its indexes
+                tokens = sql_upper.split()
+                table_name = None
+                if tokens[0] == "INSERT" and len(tokens) >= 3:
+                    table_name = tokens[2]
+                elif tokens[0] == "UPDATE" and len(tokens) >= 2:
+                    table_name = tokens[1]
+                elif tokens[0] == "DELETE" and len(tokens) >= 3:
+                    table_name = tokens[2]
+                
+                if table_name:
+                    table_name = table_name.strip('"\'()')
+                    try:
+                        index_count = len(conn.execute(f"PRAGMA index_list('{table_name}')").fetchall())
+                        total_cost += index_count * 5.0  # WRITE_PENALTY
+                    except sqlite3.Error:
+                        pass
+                continue
+
             plan_text = " ".join(str(row["detail"]) for row in rows).upper()
             if "SCAN" in plan_text:
                 total_cost += SCAN_PENALTY
@@ -144,7 +171,7 @@ class Simulator:
                 total_cost += SEARCH_PENALTY
         
 
-        return total_cost
+        return total_cost / len(queries)
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -182,7 +209,7 @@ class Simulator:
             cost_before = self._estimate_cost(conn, relevant_queries)
             write_cost_before = self._estimate_cost(conn, write_queries)
 
-            self._apply_action(conn, table, column, action)
+            original_sql = self._apply_action(conn, table, column, action)
             conn.commit()
             conn.execute("ANALYZE")  
 
@@ -200,6 +227,44 @@ class Simulator:
             action=action, table=table, column=column,
             cost_before=cost_before, cost_after=cost_after,
             write_overhead=write_overhead, reward=reward,
+            original_index_sql=original_sql
+        )
+
+    def evaluate_batch(self, actions: List[Tuple[str, str, str]]) -> SimulationResult:
+        """Evaluates a batch of (table, column, action) tuples, deduplicating queries."""
+        # For a full batch evaluation of a strategy, we must measure against the entire workload
+        # to ensure fair cost comparison across different strategies.
+        relevant_queries = self._read_log()
+        write_queries = [q for q in relevant_queries if q["sql"].strip().upper().startswith(("INSERT", "UPDATE", "DELETE"))]
+
+        scratch_path = self._make_scratch_copy()
+        conn = sqlite3.connect(scratch_path)
+        conn.row_factory = sqlite3.Row
+
+        try:
+            conn.execute("ANALYZE")
+            cost_before = self._estimate_cost(conn, relevant_queries)
+            write_cost_before = self._estimate_cost(conn, write_queries)
+
+            for table, column, action in actions:
+                self._apply_action(conn, table, column, action)
+            conn.commit()
+            conn.execute("ANALYZE")
+
+            cost_after = self._estimate_cost(conn, relevant_queries)
+            write_cost_after = self._estimate_cost(conn, write_queries)
+
+            write_overhead = max(0.0, write_cost_after - write_cost_before)
+            reward = (cost_before - cost_after) - (self.overhead_weight * write_overhead)
+        finally:
+            conn.close()
+            self._cleanup_scratch(scratch_path)
+
+        return SimulationResult(
+            action="BATCH", table="BATCH", column="BATCH",
+            cost_before=cost_before, cost_after=cost_after,
+            write_overhead=write_overhead, reward=reward,
+            original_index_sql=None
         )
 
 
