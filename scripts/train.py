@@ -10,13 +10,12 @@ from policy import BanditPolicy
 from simulator import Simulator
 from results import ResultsReporter
 
-DATA_DIR = Path(r"d:\ixel\Ixel\data")
-LOGS_DIR = DATA_DIR / "logs"
+
 
 class Trainer:
-    def __init__(self, data_dir: str = str(DATA_DIR), logs_dir: str = str(LOGS_DIR)):
+    def __init__(self, data_dir: str = "./data", logs_dir: str = None):
         self.data_dir = Path(data_dir)
-        self.logs_dir = Path(logs_dir)
+        self.logs_dir = Path(logs_dir) if logs_dir else self.data_dir / "logs"
         self.dbs = self._get_training_dbs()
         self.db_states = {}
         self.reward_history = []
@@ -102,5 +101,10 @@ class Trainer:
         return self.reward_history
 
 if __name__ == "__main__":
-    trainer = Trainer()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default="./data")
+    args = parser.parse_args()
+
+    trainer = Trainer(data_dir=args.data_dir)
     trainer.train(num_steps=1000)
