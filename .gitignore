@@ -2,12 +2,23 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-*.db
-*.jsonl
-*.pth
-changelog.json
-data/
-models/
-logs/
 *.egg-info/
 *.zip
+
+# Ignore data/ contents but keep the directory
+data/*
+!data/.gitkeep
+!data/results/.gitkeep
+
+# Ignore logs but keep the directory
+logs/*
+!logs/.gitkeep
+
+# Ignore models but keep the directory
+models/*
+!models/.gitkeep
+!models/universal_zero_shot.pth
+
+# Never ignore experiments reports
+!experiments/*.md
+experiments/*.csv
