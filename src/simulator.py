@@ -28,6 +28,10 @@ class SimulationResult:
 
 
 class Simulator:
+    _global_log_cache = {}
+    _global_relevant_cache = {}
+    _global_write_cache = {}
+
     def __init__(self, db_path: str, log_path: str, overhead_weight: float = 0.1):
         self.db_path = db_path
         self.log_path = log_path
@@ -38,9 +42,12 @@ class Simulator:
     # Query selection
     # ------------------------------------------------------------------
     def _read_log(self) -> List[dict]:
-        if hasattr(self, "_cached_log"):
-            return self._cached_log
+        if self.log_path in Simulator._global_log_cache:
+            return Simulator._global_log_cache[self.log_path]
+        
         entries = []
+        relevant_map = {}
+        write_map = {}
         try:
             with open(self.log_path, "r") as f:
                 for line in f:
@@ -50,46 +57,68 @@ class Simulator:
                     entry = json.loads(line)
                     if entry.get("error"):
                         continue
+                    
+                    sql = entry["sql"]
+                    entry["usages"] = self.query_parser.parse(sql)
+                    sql_upper = sql.strip().upper()
+                    entry["sql_upper"] = sql_upper
+                    
                     entries.append(entry)
+
+                    # Pre-index by (table, column)
+                    for u in entry["usages"]:
+                        tbl = u.table.lower() if u.table else "unknown"
+                        col = u.column.lower() if u.column else "unknown"
+                        key = (tbl, col)
+                        if key not in relevant_map:
+                            relevant_map[key] = []
+                        relevant_map[key].append(entry)
+
+                    # Pre-index write queries by table
+                    if sql_upper.startswith(("INSERT", "UPDATE", "DELETE")):
+                        tokens = sql_upper.split()
+                        table_name = None
+                        if tokens[0] == "INSERT" and len(tokens) >= 3:
+                            table_name = tokens[2]
+                        elif tokens[0] == "UPDATE" and len(tokens) >= 2:
+                            table_name = tokens[1]
+                        elif tokens[0] == "DELETE" and len(tokens) >= 3:
+                            table_name = tokens[2]
+                        if table_name:
+                            tbl_clean = table_name.strip('"\'()').upper()
+                            if tbl_clean not in write_map:
+                                write_map[tbl_clean] = []
+                            write_map[tbl_clean].append(entry)
         except FileNotFoundError:
             pass
-        self._cached_log = entries
+            
+        Simulator._global_log_cache[self.log_path] = entries
+        Simulator._global_relevant_cache[self.log_path] = relevant_map
+        Simulator._global_write_cache[self.log_path] = write_map
         return entries
 
     def _get_relevant_queries(self, table: str, column: str) -> List[dict]:
         """Queries where (table, column) appears in WHERE/JOIN/ORDER_BY/GROUP_BY."""
-        relevant = []
-        for entry in self._read_log():
-            sql = entry["sql"]
-            usages = self.query_parser.parse(sql)
-            if any(u.table == table and u.column == column for u in usages):
-                relevant.append(entry)
-        return relevant
+        self._read_log()
+        relevant_map = Simulator._global_relevant_cache.get(self.log_path, {})
+        return relevant_map.get((table.lower(), column.lower()), [])
 
     def _get_write_queries(self, table: str) -> List[dict]:
         """Logged INSERT/UPDATE/DELETE statements affecting `table`."""
-        writes = []
-        for entry in self._read_log():
-            sql_upper = entry["sql"].strip().upper()
-            if sql_upper.startswith(("INSERT", "UPDATE", "DELETE")) and table.upper() in sql_upper:
-                writes.append(entry)
-        return writes
+        self._read_log()
+        write_map = Simulator._global_write_cache.get(self.log_path, {})
+        return write_map.get(table.upper(), [])
 
     # ------------------------------------------------------------------
-    # Scratch copy management
+    # In-memory scratch copy management
     # ------------------------------------------------------------------
-    def _make_scratch_copy(self) -> str:
-        fd, scratch_path = tempfile.mkstemp(suffix=".db")
-        os.close(fd) 
-        shutil.copyfile(self.db_path, scratch_path)
-        return scratch_path
-
-    def _cleanup_scratch(self, scratch_path: str):
-        try:
-            if os.path.exists(scratch_path):
-                os.remove(scratch_path)
-        except OSError:
-            pass  
+    def _make_scratch_conn(self) -> sqlite3.Connection:
+        src = sqlite3.connect(self.db_path)
+        mem_conn = sqlite3.connect(":memory:")
+        src.backup(mem_conn)
+        src.close()
+        mem_conn.row_factory = sqlite3.Row
+        return mem_conn
 
     # ------------------------------------------------------------------
     # Applying the action for real
@@ -130,22 +159,16 @@ class Simulator:
     def _estimate_cost(self, conn: sqlite3.Connection, queries: List[dict]) -> float:
         if not queries:
             return 0.0
-        total_cost = 0.0
-        for entry in queries:
-            sql = entry["sql"]
-            try:
-                params = entry.get("params") or []
-                params = [p for p in params if isinstance(p, (int, float, str, bytes))]
-                rows = conn.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
-            except sqlite3.Error:
-                try:
-                    rows = conn.execute(f"EXPLAIN QUERY PLAN {sql}").fetchall()
-                except sqlite3.Error:
-                    continue 
+        
+        write_cost = 0.0
+        read_cost = 0.0
+        read_queries = []
+        write_counts = {}
 
-            sql_upper = sql.strip().upper()
+        # 1. Separate reads from writes and group writes by table
+        for entry in queries:
+            sql_upper = entry.get("sql_upper") or entry["sql"].strip().upper()
             if sql_upper.startswith(("INSERT", "UPDATE", "DELETE")):
-                # Calculate write overhead by finding the table and counting its indexes
                 tokens = sql_upper.split()
                 table_name = None
                 if tokens[0] == "INSERT" and len(tokens) >= 3:
@@ -157,21 +180,47 @@ class Simulator:
                 
                 if table_name:
                     table_name = table_name.strip('"\'()')
-                    try:
-                        index_count = len(conn.execute(f"PRAGMA index_list('{table_name}')").fetchall())
-                        total_cost += index_count * 5.0  # WRITE_PENALTY
-                    except sqlite3.Error:
-                        pass
-                continue
+                    write_counts[table_name] = write_counts.get(table_name, 0) + 1
+            else:
+                read_queries.append(entry)
+
+        # 2. Extremely fast write penalty calculation (1 query per table instead of thousands)
+        for table_name, count in write_counts.items():
+            try:
+                index_count = len(conn.execute(f"PRAGMA index_list('{table_name}')").fetchall())
+                write_cost += (index_count * 5.0) * count  # WRITE_PENALTY
+            except sqlite3.Error:
+                pass
+
+        # 3. Fast random sampling for read queries (Max 100 to prevent freezing)
+        import random
+        sampled_reads = read_queries
+        if len(read_queries) > 100:
+            sampled_reads = random.sample(read_queries, 100)
+            
+        for entry in sampled_reads:
+            sql = entry["sql"]
+            try:
+                params = entry.get("params") or []
+                params = [p for p in params if isinstance(p, (int, float, str, bytes))]
+                rows = conn.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
+            except sqlite3.Error:
+                try:
+                    rows = conn.execute(f"EXPLAIN QUERY PLAN {sql}").fetchall()
+                except sqlite3.Error:
+                    continue 
 
             plan_text = " ".join(str(row["detail"]) for row in rows).upper()
             if "SCAN" in plan_text:
-                total_cost += SCAN_PENALTY
+                read_cost += SCAN_PENALTY
             elif "SEARCH" in plan_text:
-                total_cost += SEARCH_PENALTY
+                read_cost += SEARCH_PENALTY
         
-
-        return total_cost / len(queries)
+        # Scale the read cost back up to match the full log magnitude
+        if len(sampled_reads) > 0:
+            read_cost = (read_cost / len(sampled_reads)) * len(read_queries)
+            
+        return read_cost + write_cost
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -200,9 +249,7 @@ class Simulator:
         relevant_queries = self._get_relevant_queries(table, column)
         write_queries = self._get_write_queries(table)
 
-        scratch_path = self._make_scratch_copy()
-        conn = sqlite3.connect(scratch_path)
-        conn.row_factory = sqlite3.Row
+        conn = self._make_scratch_conn()
 
         try:
             conn.execute("ANALYZE")
@@ -221,7 +268,6 @@ class Simulator:
 
         finally:
             conn.close()
-            self._cleanup_scratch(scratch_path)
 
         return SimulationResult(
             action=action, table=table, column=column,
@@ -237,9 +283,7 @@ class Simulator:
         relevant_queries = self._read_log()
         write_queries = [q for q in relevant_queries if q["sql"].strip().upper().startswith(("INSERT", "UPDATE", "DELETE"))]
 
-        scratch_path = self._make_scratch_copy()
-        conn = sqlite3.connect(scratch_path)
-        conn.row_factory = sqlite3.Row
+        conn = self._make_scratch_conn()
 
         try:
             conn.execute("ANALYZE")
@@ -258,7 +302,6 @@ class Simulator:
             reward = (cost_before - cost_after) - (self.overhead_weight * write_overhead)
         finally:
             conn.close()
-            self._cleanup_scratch(scratch_path)
 
         return SimulationResult(
             action="BATCH", table="BATCH", column="BATCH",
